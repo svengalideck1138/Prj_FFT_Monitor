@@ -150,26 +150,6 @@ private void timer2_Tick(object sender, EventArgs e)
 - 수신 데이터를 **Producer-Consumer 큐** 또는 별도 파서 스레드로 분리
 - 공유 버퍼는 **`lock` 기반 보호** 또는 **더블 버퍼링**으로 보호
 
-## 참고 자료 (References)
-
-FFT를 펌웨어로 구현하기에 앞서, **Excel로 시간 영역 → 주파수 영역 변환 과정을 먼저 검증**하며 원리를 이해했습니다. 아래 자료를 참고했습니다.
-
-- **[Frequency Domain Using Excel](docs/references/Excel_FFT_Instructions.pdf)** — Larry Klingenberg, San Francisco State University, School of Engineering (April 2005)
-  - Excel의 *Analysis ToolPak → Fourier Analysis* 기능으로 샘플 데이터를 FFT 복소수로 변환하고, 크기 스펙트럼을 그리는 단계별 가이드
-- **[FFT 예제 스프레드시트](docs/references/FFT_example.xlsx)** — Signal Generator로 주파수를 생성하고 이를 Oscilloscope에 연결하여 그 데이터를 엑셀로 추출해서 위의 가이드를 통해서 동일하게 작업을 진행했고, 이를 통해서 어떤 FFT를 구현하기 위해서 중요한 척도 및 파라미터가 무엇인지 공부할 수 있었음.
-  - 컬럼 구성: `second`(시간) · `Volt`(샘플 데이터) · `FFT Freq` · `FFT complex` · `FFTmag`, 파라미터: `Data length(D)`, `sampling time(t)`, `sampling Freq(Fs)`
-
-### 검증 내용
-
-참고 자료의 FFT 산출 방식을 엑셀 예제로 직접 재현·검증한 뒤 프로그램에 반영했으며, 핵심 개념이 본 프로그램 구현과 정확히 일치함을 확인했습니다.
-
-- **2의 거듭제곱 샘플 수 사용**: FFT 입력은 2ⁿ개여야 한다는 제약 → 본 프로그램은 `Samples = 256 (2⁸)` 사용
-- **표시 구간 제한**: `sa/2`를 초과해 플롯하면 FFT 결과가 대칭으로 반복됨 → 본 프로그램은 FFT 차트에서 `Samples / 2`까지만 표시
-- **주파수 축**: `freq = n × fs / sa` (예제의 `FFT Freq` 열과 동일한 구조)
-- **크기(magnitude) 계산**: `2/sa × |FFT complex|` (예제의 `=2/1024*IMABS(E)` 와 동일)
-
-이 자료들을 통해 FFT 결과의 의미와 표시 범위를 명확히 이해할 수 있었고, 프로그램 제작에 큰 도움이 되었습니다.
-
 ## 프로젝트 구조
 
 ```
@@ -180,3 +160,12 @@ FFT_Monitor_STM32/
 ├── Properties/           # 어셈블리 정보, 리소스, 설정
 └── FFT_Monitor_STM32.sln # 솔루션 파일
 ```
+
+## 참고 자료 (References)
+
+FFT를 펌웨어로 구현하기에 앞서, **Excel로 시간 영역 → 주파수 영역 변환 과정을 먼저 검증**하며 원리를 이해했습니다. 아래 자료를 참고했습니다.
+
+- **[Frequency Domain Using Excel](docs/references/Excel_FFT_Instructions.pdf)** — Larry Klingenberg, San Francisco State University, School of Engineering (April 2005)
+  - Excel의 *Analysis ToolPak → Fourier Analysis* 기능으로 샘플 데이터를 FFT 복소수로 변환하고, 크기 스펙트럼을 그리는 단계별 가이드
+- **[FFT 예제 스프레드시트](docs/references/FFT_example.xlsx)** — Signal Generator로 주파수를 생성하고 이를 Oscilloscope에 연결하여 그 데이터를 엑셀로 추출해서 위의 가이드를 통해서 동일하게 작업을 진행했고, 이를 통해서 어떤 FFT를 구현하기 위해서 중요한 척도 및 파라미터가 무엇인지 공부할 수 있었음.
+  - 컬럼 구성: `second`(시간) · `Volt`(샘플 데이터) · `FFT Freq` · `FFT complex` · `FFTmag`, 파라미터: `Data length(D)`, `sampling time(t)`, `sampling Freq(Fs)`
