@@ -61,12 +61,100 @@ msbuild FFT_Monitor_STM32.sln /p:Configuration=Release
 
 > ⚠️ **스레드 처리 안정성 문제 (가장 중요)**
 >
-> 현재 시리얼 수신(`DataReceived` 이벤트 스레드)과 차트 갱신(`timer1` / `timer2` UI 스레드)이
-> 공유 배열(`RawIntDataArray`, `FFTIntDataArray` 등)에 **동기화 없이 동시에 접근**합니다.
-> 이로 인해 **시간이 지나면 데이터 수신이 멈추거나, 그래프 갱신이 더 이상 반영되지 않는** 현상이 발생합니다.
->
-> 수신 스레드와 UI 갱신 사이의 스레드 동기화 / 버퍼 관리 구조를 재설계할 필요가 있습니다.
-> (예: lock 기반 보호, 더블 버퍼링, Producer-Consumer 큐 도입 등)
+> **시간이 지나면 데이터 수신이 멈추고, 그래프 갱신이 더 이상 반영되지 않는** 현상이 발생합니다.
+> 원인은 시리얼 수신 이벤트 핸들러 내부의 블로킹 처리와, 수신 스레드·UI 타이머 간 비동기화 공유 배열 접근입니다.
+
+### 문제 1. `ReadByte()` — 수신 콜백 스레드를 블로킹하고 모달 팝업까지 띄움 (`Form1.cs`)
+
+```csharp
+private int ReadByte()
+{
+    int trial = 50;
+    while (trial > 0)                          // ← 최대 50번 반복
+    {
+        if (serialPort1.BytesToRead > 0)
+        {
+            return serialPort1.ReadByte();
+        }
+        Thread.Sleep(1);                       // ← 수신 콜백 스레드를 잠재움
+        trial--;
+    }
+    if (trial == 0)
+    {
+        MessageBox.Show("데이터가 없습니다.");   // ← 수신 스레드에서 모달 창!
+    }
+    return 0;
+}
+```
+
+### 문제 2. `serialPort1_DataReceived` — 위 `ReadByte()`를 바이트마다 반복 호출 + 비동기화 공유 배열 교체 (`Form1.cs`)
+
+```csharp
+private void serialPort1_DataReceived(object sender, SerialDataReceivedEventArgs e)
+{
+    ...
+    sync[0] = this.ReadByte();     // 한 바이트마다 최대 50ms 블로킹 가능
+    sync[1] = this.ReadByte();
+    id[0]   = this.ReadByte();
+    ...
+    while (tot_size > 0)
+    {
+        DataBuffer_Raw.Add(this.ReadByte());    // 수백 바이트 × 블로킹 루프
+        tot_size--;
+    }
+    RawIntDataArray = DataBuffer_Raw.ToArray();  // ← 동기화 없이 공유 배열 교체
+}
+```
+
+### 문제 3. `timer1_Tick` / `timer2_Tick` — UI 스레드가 같은 공유 배열을 lock 없이 읽음 (`Form1.cs`)
+
+```csharp
+private void timer1_Tick(object sender, EventArgs e)
+{
+    chart1.Series["Series1"].Points.Clear();
+
+    for (int i = 0; i < Samples; i++)
+    {
+        RawIntArray[i] = RawIntDataArray[i];   // ← 수신 스레드가 교체 중인 배열을 동시 읽기
+    }
+    for (int i = 0; i < Samples; i++)
+    {
+        chart1.Series["Series1"].Points.AddXY(i, RawIntArray[i]);
+    }
+}
+
+private void timer2_Tick(object sender, EventArgs e)
+{
+    chart2.Series["Series1"].Points.Clear();
+
+    for (int i = 0; i < Samples * 4; i++)
+    {
+        FFTByteArray[i] = (byte)FFTIntDataArray[i];   // ← 패킷 크기가 다르면 IndexOutOfRange
+    }
+    for (int i = 0; i < Samples; i++)
+    {
+        FFTFloatArray[i] = BitConverter.ToSingle(FFTByteArray, i * 4);
+    }
+    for (int i = 2; i < Samples / 2; i++)
+    {
+        chart2.Series["Series1"].Points.AddXY(i, FFTFloatArray[i]);
+    }
+}
+```
+
+`Samples(256)` 크기를 고정 가정하므로, 수신 패킷 크기가 다르거나 교체 도중 읽으면 예외가 발생하고, 한 번 예외가 나면 해당 타이머 틱이 죽어 그래프 갱신이 멈춥니다.
+
+### 왜 시간이 지나면 멈추는가
+
+1. **블로킹 누적 → 버퍼 오버런**: `DataReceived`는 직렬화된 단일 콜백 스레드에서 실행됩니다. 이 핸들러 안에서 `ReadByte()`가 `Thread.Sleep(1)`로 바이트마다 대기하면 한 패킷(수백 바이트)을 처리하는 동안 콜백이 길게 점유되고, 그 사이 들어오는 데이터가 드라이버 버퍼에 쌓여 오버런이 발생합니다. 결국 이벤트가 더 이상 정상적으로 올라오지 않습니다.
+2. **모달 팝업이 수신 파이프라인을 정지**: 데이터가 잠깐 끊겨 `trial`이 0이 되면 수신 스레드에서 `MessageBox`가 떠, 사용자가 OK를 누르기 전까지 수신 전체가 멈춥니다. "어느 순간 수신이 멈춘다"의 직접적인 원인입니다.
+3. **비동기화 공유 배열**: `RawIntDataArray` / `FFTIntDataArray`를 수신 스레드가 lock 없이 교체하고 UI 타이머(`timer1` / `timer2`)가 동시에 읽습니다. 교체 도중 읽으면 깨진 데이터나 예외가 발생하고, 예외가 한 번 나면 해당 타이머 틱이 죽어 그래프가 더 이상 갱신되지 않습니다.
+
+### 개선 방향
+
+- `DataReceived` 핸들러는 **읽기만 빠르게** 수행하고 즉시 반환 (`Thread.Sleep` / `MessageBox` 제거)
+- 수신 데이터를 **Producer-Consumer 큐** 또는 별도 파서 스레드로 분리
+- 공유 버퍼는 **`lock` 기반 보호** 또는 **더블 버퍼링**으로 보호
 
 ## 프로젝트 구조
 
