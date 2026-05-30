@@ -1,5 +1,9 @@
 # FFT Monitor for STM32
 
+![STM32 FFT Monitor 실행 화면](docs/screenshot.png)
+
+> 상단: Raw ADC 파형 / 하단: FFT 스펙트럼 (Fundamental Freq 표시)
+
 STM32 보드에서 시리얼(UART/COM) 포트로 전송하는 **Raw ADC 데이터**와 **FFT 연산 결과**를 PC에서 실시간으로 수신하여 그래프로 표시하는 Windows 모니터링 도구입니다.
 
 C# WinForms 기반이며, `System.Windows.Forms.DataVisualization` 차트를 사용해 두 개의 그래프(Raw / FFT)를 동시에 그립니다.
@@ -37,11 +41,7 @@ STM32 펌웨어는 다음 포맷으로 패킷을 전송해야 합니다. (big-en
 
 ## 빌드 및 실행
 
-```sh
-# Visual Studio에서 FFT_Monitor_STM32.sln 열고 빌드(F5)
-```
-
-또는 MSBuild 사용:
+Visual Studio에서 `FFT_Monitor_STM32.sln`을 열고 빌드(F5)하거나, MSBuild를 사용합니다:
 
 ```sh
 msbuild FFT_Monitor_STM32.sln /p:Configuration=Release
@@ -56,6 +56,24 @@ msbuild FFT_Monitor_STM32.sln /p:Configuration=Release
 3. 포트 / Baud Rate 등 통신 파라미터를 설정한 뒤 **OPEN**을 클릭합니다.
 4. 수신 모드(ASCII / HEX)를 선택합니다. (프로토콜 파싱은 HEX 모드 기준)
 5. **Start**를 눌러 Raw / FFT 차트 갱신을 시작하고, **Stop**으로 중지합니다.
+
+## 알려진 문제 (Known Issues)
+
+> ⚠️ **스레드 처리 안정성 문제 (가장 중요)**
+>
+> 현재 시리얼 수신(`DataReceived` 이벤트 스레드)과 차트 갱신(`timer1` / `timer2` UI 스레드)이
+> 공유 배열(`RawIntDataArray`, `FFTIntDataArray` 등)에 **동기화 없이 동시에 접근**합니다.
+> 이로 인해 **시간이 지나면 데이터 수신이 멈추거나, 그래프 갱신이 더 이상 반영되지 않는** 현상이 발생합니다.
+>
+> 수신 스레드와 UI 갱신 사이의 스레드 동기화 / 버퍼 관리 구조를 재설계할 필요가 있습니다.
+> (예: lock 기반 보호, 더블 버퍼링, Producer-Consumer 큐 도입 등)
+
+그 외 확인된 문제:
+
+- **기본 주파수 표시 미동작**: 화면 하단 `Fundamental Freq` 값이 계산되지 않고 초기 텍스트(`label2`)가 그대로 표시됩니다.
+- **종료 확인 동작 반전**: 종료 확인 창에서 "예/아니오" 선택에 따른 포트 정리 동작이 의도와 반대로 처리됩니다.
+- **수신 중 팝업 반복**: 데이터 수신 타임아웃 시 "데이터가 없습니다." 메시지 박스가 반복적으로 나타날 수 있습니다.
+- **고정 샘플 수 가정**: 샘플 수가 256으로 고정되어 있어, 다른 크기의 패킷 수신 시 예외가 발생할 수 있습니다.
 
 ## 프로젝트 구조
 
