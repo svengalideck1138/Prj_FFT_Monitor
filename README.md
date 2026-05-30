@@ -1,6 +1,6 @@
 # FFT Monitor for STM32
 
-![STM32 FFT Monitor 실행 화면](docs/screenshot.png)
+![STM32 FFT Monitor 실행 화면](docs/ProgramScreenshot.png)
 
 > 상단: Raw ADC 파형 / 하단: FFT 스펙트럼 (Fundamental Freq 표시)
 
@@ -67,13 +67,6 @@ msbuild FFT_Monitor_STM32.sln /p:Configuration=Release
 >
 > 수신 스레드와 UI 갱신 사이의 스레드 동기화 / 버퍼 관리 구조를 재설계할 필요가 있습니다.
 > (예: lock 기반 보호, 더블 버퍼링, Producer-Consumer 큐 도입 등)
-
-그 외 확인된 문제:
-
-- **기본 주파수 표시 미동작**: 화면 하단 `Fundamental Freq` 값이 계산되지 않고 초기 텍스트(`label2`)가 그대로 표시됩니다.
-- **종료 확인 동작 반전**: 종료 확인 창에서 "예/아니오" 선택에 따른 포트 정리 동작이 의도와 반대로 처리됩니다.
-- **수신 중 팝업 반복**: 데이터 수신 타임아웃 시 "데이터가 없습니다." 메시지 박스가 반복적으로 나타날 수 있습니다.
-- **고정 샘플 수 가정**: 샘플 수가 256으로 고정되어 있어, 다른 크기의 패킷 수신 시 예외가 발생할 수 있습니다.
 
 ## 프로젝트 구조
 
