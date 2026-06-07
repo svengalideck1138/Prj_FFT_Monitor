@@ -1,6 +1,6 @@
 # FFT Monitor for STM32
 
-![STM32 FFT Monitor 실행 화면](docs/ProgramScreenshot.png)
+![STM32 FFT Monitor 실행 화면](docs/ProgramScreenshot02.png)
 
 > 상단: Raw ADC 파형 / 하단: FFT 스펙트럼 (Fundamental Freq 표시)
 
@@ -12,10 +12,11 @@ C# WinForms 기반이며, `System.Windows.Forms.DataVisualization` 차트를 사
 
 - COM 포트 자동 검색 및 통신 설정(Baud Rate, Data Bits, Stop Bits, Parity) 구성
 - 시리얼 흐름 제어 신호(CTS / DSR / DTR / RTS / CD) 표시
-- ASCII / HEX 수신 모드 지원
-- STM32 커스텀 프로토콜 파싱 (Raw / FFT 패킷 구분)
-- Raw ADC 파형과 FFT 스펙트럼을 별도 차트로 실시간 갱신
-- 수신 데이터 항상 갱신 / 누적 표시 모드 선택
+- HEX(바이너리) 커스텀 프로토콜 수신·파싱 (Raw / FFT 패킷 구분)
+- 전용 파서 스레드 + 상태머신 기반의 안정적인 수신 처리 (시간이 지나도 끊김 없음)
+- Raw ADC 파형(Time Domain)과 FFT 스펙트럼(Freq Domain)을 별도 차트로 실시간 갱신
+- 차트 축 고정 표시 · Y축 라벨 정수화 · 마우스 휠로 Y축 확대/축소
+- FFT 피크 기반 Fundamental Frequency(기본 주파수) 표시
 
 ## 통신 프로토콜
 
@@ -28,8 +29,8 @@ STM32 펌웨어는 다음 포맷으로 패킷을 전송해야 합니다. (big-en
 | Length    | 2         | 페이로드 바이트 수 (`hi << 8 | lo`) |
 | Payload   | Length    | 데이터 본문                        |
 
-- **Raw 패킷(ID `0x01`)**: ADC 샘플 값 (정수 배열, 256 샘플 기준)
-- **FFT 패킷(ID `0x02`)**: 4바이트 IEEE-754 `float` 단위로 인코딩된 FFT 결과 (`Samples × 4` 바이트). PC 측에서 `BitConverter.ToSingle`로 복원해 앞쪽 절반(`Samples / 2`)만 표시합니다.
+- **Raw 패킷(ID `0x01`)**: 1바이트 = 1샘플 (256개, 0~255). Time Domain 파형으로 표시합니다.
+- **FFT 패킷(ID `0x02`)**: 4바이트 IEEE-754 `float` × N (1024바이트 = 256개). PC 측에서 `BitConverter.ToSingle`로 복원해 앞쪽 절반(`Samples / 2`)만 표시합니다. 페이로드 길이가 4의 배수가 아니면 손상 패킷으로 보고 버립니다.
 
 > 기본 샘플 수는 `Samples = 256`으로 설정되어 있습니다 (`Form1.cs`).
 
@@ -54,15 +55,16 @@ msbuild FFT_Monitor_STM32.sln /p:Configuration=Release
 1. STM32 보드를 PC에 연결합니다.
 2. 프로그램을 실행하고 **Refresh**로 COM 포트를 검색합니다.
 3. 포트 / Baud Rate 등 통신 파라미터를 설정한 뒤 **OPEN**을 클릭합니다.
-4. 수신 모드(ASCII / HEX)를 선택합니다. (프로토콜 파싱은 HEX 모드 기준)
-5. **Start**를 눌러 Raw / FFT 차트 갱신을 시작하고, **Stop**으로 중지합니다.
+4. **Start**를 눌러 Raw / FFT 차트 갱신을 시작하고, **Stop**으로 중지합니다.
+5. 차트 위에 마우스를 올린 상태에서 휠을 돌리면 해당 그래프의 Y축이 확대/축소됩니다.
 
-## 알려진 문제 (Known Issues)
+## 문제와 해결 (Issues & Fixes)
 
-> ⚠️ **스레드 처리 안정성 문제 (가장 중요)**
+> ✅ **아래 스레드 안정성·파싱 문제들은 모두 해결되었습니다.**
 >
-> **시간이 지나면 데이터 수신이 멈추고, 그래프 갱신이 더 이상 반영되지 않는** 현상이 발생합니다.
-> 원인은 시리얼 수신 이벤트 핸들러 내부의 블로킹 처리와, 수신 스레드·UI 타이머 간 비동기화 공유 배열 접근입니다.
+> 초기 구현에서는 **시간이 지나면 수신이 멈추고 그래프 갱신이 끊기는** 현상이 있었습니다.
+> 원인은 시리얼 수신 핸들러 내부의 블로킹 처리와, 수신 스레드·UI 타이머 간 비동기화 공유 배열 접근이었습니다.
+> 각 문제의 원인 코드와 **실제 적용한 해결 코드**를 함께 기록합니다.
 
 ### 문제 1. `ReadByte()` — 수신 콜백 스레드를 블로킹하고 모달 팝업까지 띄움 (`Form1.cs`)
 
@@ -87,6 +89,24 @@ private int ReadByte()
 }
 ```
 
+**✅ 해결** — 수신 핸들러에서 `Thread.Sleep`·`MessageBox`·바이트 단위 블로킹을 모두 제거하고, 버퍼를 통째로 읽어 큐에 넣고 즉시 반환합니다.
+
+```csharp
+private void serialPort1_DataReceived(object sender, SerialDataReceivedEventArgs e)
+{
+    try
+    {
+        int n = serialPort1.BytesToRead;
+        if (n <= 0) return;
+        var buf = new byte[n];
+        int read = serialPort1.Read(buf, 0, n);
+        if (read < n) Array.Resize(ref buf, read);
+        if (read > 0) _rx.Add(buf);   // 큐에 넘기고 즉시 반환 (Sleep/MessageBox 제거)
+    }
+    catch { }
+}
+```
+
 ### 문제 2. `serialPort1_DataReceived` — 위 `ReadByte()`를 바이트마다 반복 호출 + 비동기화 공유 배열 교체 (`Form1.cs`)
 
 ```csharp
@@ -103,6 +123,26 @@ private void serialPort1_DataReceived(object sender, SerialDataReceivedEventArgs
         tot_size--;
     }
     RawIntDataArray = DataBuffer_Raw.ToArray();  // ← 동기화 없이 공유 배열 교체
+}
+```
+
+**✅ 해결** — 파싱을 전용 파서 스레드로 분리(Producer-Consumer)하고 상태머신으로 패킷을 조립하며, 완성된 배열을 `lock`으로 보호해 교체합니다.
+
+```csharp
+// 전용 파서 스레드: 상태머신으로 분할 수신/재동기화 처리
+private void ParserLoop()
+{
+    var st = St.Sync0;
+    foreach (var chunk in _rx.GetConsumingEnumerable())
+        foreach (byte b in chunk)
+            // Sync0 → Sync1 → Id → LenHi → LenLo → Payload, 완성 시 Dispatch(id, pl)
+            ;
+}
+
+private void Dispatch(byte id, byte[] pl)
+{
+    if (id == ID_RAW)      { /* 1바이트=1샘플 디코딩 */ lock (_lock) _rawSnap = r; }
+    else if (id == ID_FFT) { /* float32 디코딩 */       lock (_lock) _fftSnap = f; }
 }
 ```
 
@@ -144,11 +184,26 @@ private void timer2_Tick(object sender, EventArgs e)
 
 `Samples(256)` 크기를 고정 가정하므로, 수신 패킷 크기가 다르거나 교체 도중 읽으면 예외가 발생하고, 한 번 예외가 나면 해당 타이머 틱이 죽어 그래프 갱신이 멈춥니다.
 
-### 개선 방향
+**✅ 해결** — 타이머는 `lock`으로 스냅샷 참조만 받아 그리고, `Math.Min`으로 크기를 안전하게 제한합니다. (차트 Y축 고정 + 값 가드로 OverflowException도 방지)
 
-- `DataReceived` 핸들러는 **읽기만 빠르게** 수행하고 즉시 반환 (`Thread.Sleep` / `MessageBox` 제거)
-- 수신 데이터를 **Producer-Consumer 큐** 또는 별도 파서 스레드로 분리
-- 공유 버퍼는 **`lock` 기반 보호** 또는 **더블 버퍼링**으로 보호
+```csharp
+private void timer1_Tick(object sender, EventArgs e)
+{
+    int[] r; lock (_lock) r = _rawSnap;          // 참조만 잠깐 잠금
+    var s = chart1.Series["Series1"]; s.Points.Clear();
+    int n = Math.Min(Samples, r.Length);         // 크기 안전 처리
+    for (int i = 0; i < n; i++) s.Points.AddXY(i, r[i]);
+}
+```
+
+### 적용 결과 (요약)
+
+- **Producer-Consumer 구조**: `BlockingCollection<byte[]>` 큐 + 전용 파서 스레드(`IsBackground`)
+- **상태머신 파서**: `Sync0 → Sync1 → Id → LenHi → LenLo → Payload`, 분할 수신/재동기화, 길이 검증
+- **공유 데이터 보호**: `lock` + 스냅샷 참조 교체로 경쟁 조건 제거
+- **차트 안정화**: Y축 고정 · 정수 라벨 · NaN/Infinity/초대형 값 가드로 OverflowException 방지
+- **UI 개선**: ASCII 제거(HEX 전용), 마우스 휠 Y축 확대/축소, Fundamental Frequency 표시
+- **안전 종료**: `volatile` 플래그 + `CompleteAdding()` + `Join()`
 
 ## 프로젝트 구조
 
