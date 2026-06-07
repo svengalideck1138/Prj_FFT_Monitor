@@ -11,22 +11,29 @@ using System.Windows.Forms;
 
 using System.IO;
 using System.IO.Ports;
+using System.Collections.Concurrent;
+using System.Windows.Forms.DataVisualization.Charting;
 
 namespace FFT_Monitor_STM32
 {
     public partial class Form1 : Form
     {
 
-        static string dataIN = "";
-        static int dataINLength;
-
         static int Samples = 256;
-        static int[] RawIntDataArray = new int[Samples];
-        static int[] FFTIntDataArray = new int[Samples * 4];
-        static byte[] FFTByteArray = new byte[Samples * 4];
 
-        static int[] RawIntArray = new int[Samples];
-        static float[] FFTFloatArray = new float[Samples];
+        // ADC 샘플링 주파수(Hz). Fundamental Freq 계산에 사용. 펌웨어 설정에 맞게 변경하세요.
+        private const double Fs = 5500;
+
+        // ===== 시리얼 수신 → 파싱 → 표시 파이프라인 (Producer-Consumer) =====
+        private readonly BlockingCollection<byte[]> _rx = new BlockingCollection<byte[]>();
+        private Thread _parser;
+        private volatile bool _running;
+        private int[] _rawSnap = new int[0];
+        private float[] _fftSnap = new float[0];
+        private readonly object _lock = new object();
+
+        private const byte SYNC0 = 0x03, SYNC1 = 0x15, ID_RAW = 0x01, ID_FFT = 0x02;
+        private enum St { Sync0, Sync1, Id, LenHi, LenLo, Payload }
 
         public Form1()
         {
@@ -37,22 +44,73 @@ namespace FFT_Monitor_STM32
         private void Form1_Load(object sender, EventArgs e)
         {
             ScanSerialPorts();
-            Chk_CTS.Enabled = true;
-            Chk_DSR.Enabled = true;
-            Chk_DTR.Enabled = false;
-            Chk_RTS.Enabled = false;
-            Chk_CD.Enabled = true;
-            GBox_RxControl.Enabled = false;
+
+            // ===== TimeDomain(chart1) 축 설정 =====
+            var axRaw = chart1.ChartAreas[0].AxisX;
+            axRaw.Minimum = 0;
+            axRaw.Maximum = 254;
+            axRaw.Interval = 50;
+            var ayRaw = chart1.ChartAreas[0].AxisY;
+            ayRaw.Minimum = 0;
+            ayRaw.Maximum = 64;
+            ayRaw.Interval = 20;
+            ayRaw.LabelStyle.Format = "0";   // Y축 라벨 정수 표시
+
+            // ===== FFT(chart2) 축 설정 (자동 스케일 비활성화 → 오버플로 방지) =====
+            var axFft = chart2.ChartAreas[0].AxisX;
+            axFft.Minimum = 0;
+            axFft.Maximum = 127;
+            axFft.Interval = 20;
+            var ayFft = chart2.ChartAreas[0].AxisY;
+            ayFft.Minimum = 0;
+            ayFft.Maximum = 3500;
+            ayFft.Interval = 1000;
+            ayFft.LabelStyle.Format = "0";   // Y축 라벨 정수 표시
+
+            // 마우스를 올린 상태에서 휠로 Y축 Maximum 가변 조절 (확대/축소)
+            chart1.MouseEnter += (s, ev) => chart1.Focus();   // hover 시 휠 입력을 받도록 포커스
+            chart1.MouseWheel += chart1_MouseWheel;
+            chart2.MouseEnter += (s, ev) => chart2.Focus();
+            chart2.MouseWheel += chart2_MouseWheel;
+        }
+
+        // 차트 Y축 Maximum을 휠로 확대/축소하는 공통 처리
+        private void ZoomChartY(Chart chart, int delta, double baseMax, double baseInterval, double upperLimit)
+        {
+            var ay = chart.ChartAreas[0].AxisY;
+            double max = ay.Maximum;
+            if (double.IsNaN(max) || max <= 0) max = baseMax;
+
+            if (delta > 0) max *= 0.9;        // 휠 위로: 확대 (Maximum 감소)
+            else if (delta < 0) max /= 0.9;   // 휠 아래로: 축소 (Maximum 증가)
+
+            if (max < 10) max = 10;                 // 하한
+            if (max > upperLimit) max = upperLimit; // 상한
+
+            ay.Minimum = 0;
+            ay.Maximum = Math.Round(max);
+            // 분할 수를 일정하게 유지(라벨 폭주로 인한 오버플로 방지). Interval은 정수로 반올림.
+            ay.Interval = Math.Max(1, Math.Round(baseInterval * ay.Maximum / baseMax));
+        }
+
+        private void chart1_MouseWheel(object sender, MouseEventArgs e)
+        {
+            ZoomChartY(chart1, e.Delta, 64, 10, 255);
+        }
+
+        private void chart2_MouseWheel(object sender, MouseEventArgs e)
+        {
+            ZoomChartY(chart2, e.Delta, 3500, 1000, 100000);
         }
         private void Form1_FormClosing(object sender, FormClosingEventArgs e)
         {
-            if (MessageBox.Show("프로그램을 종료 하시겠습니까?", "RF D&C", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.No)
+            if (MessageBox.Show("프로그램을 종료 하시겠습니까?", "Zhenyu", MessageBoxButtons.YesNo, MessageBoxIcon.Question) == DialogResult.No)
             {
                 try
                 {
                     if (serialPort1.IsOpen)
                     {
-                        Chk_RxASC.Checked = false;
+                        StopParser();
                         serialPort1.DiscardOutBuffer();
                         serialPort1.Dispose();
                         serialPort1.Close();
@@ -85,29 +143,11 @@ namespace FFT_Monitor_STM32
                 serialPort1.ReadTimeout = 3000;
 
                 serialPort1.Open();
+                StartParser();
                 Btn_OPEN.Enabled = false;
                 Btn_CLOSE.Enabled = true;
-                Chk_CTS.Enabled = false;
-                Chk_DSR.Enabled = false;
-                Chk_DTR.Enabled = true;
-                Chk_RTS.Enabled = true;
-                Chk_CD.Enabled = false;
-                Chk_RxASC.Checked = true;
-                GBox_RxControl.Enabled = true;
-                progressBar1.Value = 100;
 
-                if (serialPort1.CtsHolding)
-                {
-                    Chk_CTS.Checked = true;
-                }
-                if (serialPort1.DsrHolding)
-                {
-                    Chk_DSR.Checked = true;
-                }
-                if (serialPort1.CDHolding)
-                {
-                    Chk_CD.Checked = true;
-                }
+                progressBar1.Value = 100;
             }
             catch (Exception ex)
             {
@@ -126,7 +166,7 @@ namespace FFT_Monitor_STM32
             //{
             if (serialPort1.IsOpen)
             {
-                Chk_RxASC.Checked = false;
+                StopParser();
                 serialPort1.DiscardOutBuffer();
                 serialPort1.Dispose();
                 serialPort1.Close();
@@ -135,9 +175,7 @@ namespace FFT_Monitor_STM32
             Btn_CLOSE.Enabled = false;
             CBoxCOMPORT.Enabled = true;
             CBoxBaudRate.Enabled = true;
-            Chk_DTR.Enabled = false;
-            Chk_RTS.Enabled = false;
-            GBox_RxControl.Enabled = false;
+
             progressBar1.Value = 0;
             //}
             //catch (Exception ex)
@@ -164,273 +202,89 @@ namespace FFT_Monitor_STM32
 
         private void serialPort1_DataReceived(object sender, SerialDataReceivedEventArgs e)
         {
-            if (serialPort1.IsOpen)
+            try
             {
-                if (Chk_RxASC.Checked)
+                int n = serialPort1.BytesToRead;
+                if (n <= 0) return;
+                var buf = new byte[n];
+                int read = serialPort1.Read(buf, 0, n);
+                if (read < n) Array.Resize(ref buf, read);
+                if (read > 0)
                 {
-                    dataIN = serialPort1.ReadExisting();
-                    dataINLength = dataIN.Length;
-                    this.BeginInvoke(new EventHandler(ShowData_TBoxDataIN));
+                    _rx.Add(buf);
                 }
-                else if (Chk_RxHex.Checked)
-                {
-                    //기본예제--------------------------------------------------------//
-                    //List<int> DataBuffer = new List<int>();
+            }
+            catch { }
+        }
 
-                    //while (serialPort1.BytesToRead > 0)
-                    //{
-                    //    try
-                    //    {
-                    //        DataBuffer.Add(serialPort1.ReadByte());
-                    //    }
-                    //    catch (Exception error)
-                    //    {
-                    //        MessageBox.Show(error.Message);
-                    //    }
-                    //}
+        private void StartParser()
+        {
+            _running = true;
+            _parser = new Thread(ParserLoop) { IsBackground = true };
+            _parser.Start();
+        }
 
-                    //dataINLength = DataBuffer.Count();
-                    ////dataInTemp = new int[dataINLength];
-                    //dataInTemp = DataBuffer.ToArray();
+        private void StopParser()
+        {
+            _running = false;
+            _rx.CompleteAdding();
+            _parser?.Join(500);
+        }
 
-                    //dataIN = RxDataFormat(dataInTemp);
-
-                    //this.BeginInvoke(new EventHandler(ShowData_TBoxDataIN));
-
-                    //RawDataParsing(dataInTemp);
-
-                    //옛날에 작업한 내용--------------------------------------------------------//
-
-                    //byte[] array = new byte[2048];
-                    //int ReadByteCount;
-                    //string str = string.Empty;
-                    //ReadByteCount = serialPort1.Read(array, 0, 2048);
-                    //for (int i = 0; i < ReadByteCount; i++)
-                    //{
-                    //    str += string.Format(i + "="+ "{0:x2} ", array[i]);
-                    //}
-                    //dataIN = str;
-
-                    //this.BeginInvoke(new EventHandler(ShowData_TBoxDataIN));
-
-                    //병현이가 도와준 작업-----------------------------------------------------------//
-
-                    //int[] sync = new int[2];
-                    //sync[0] = this.ReadByte(); // 0x03
-                    //sync[1] = this.ReadByte(); // 0x15
-                    //List<int> DataBuffer = new List<int>();
-
-                    //if (sync[0] == 0x03 && sync[1] == 0x15)
-                    //{
-                    //    // go
-                    //    int id = this.ReadByte();
-
-                    //    int[] raw_size = new int[2];
-                    //    raw_size[0] = this.ReadByte();
-                    //    raw_size[1] = this.ReadByte();
-                    //    int tot_size = (raw_size[0] << 8) | raw_size[1];
-
-                    //    try
-                    //    {
-                    //        while (tot_size > 0)
-                    //        {
-                    //            DataBuffer.Add(this.ReadByte());
-                    //            tot_size--;
-                    //        }
-                    //    }
-                    //    catch (Exception excep)
-                    //    {
-                    //        // no data to read
-                    //        MessageBox.Show(excep.ToString());
-                    //    }
-                    //}
-                    //else
-                    //{
-                    //    // do something error
-                    //    MessageBox.Show("Sync id not correct.");
-                    //}
-                    //MessageBox.Show("End");
-
-                    //디스플레이 동시에 파싱------------------------------------------------------//
-                    if(serialPort1.BytesToRead > 0)
+        private void ParserLoop()
+        {
+            var st = St.Sync0;
+            byte id = 0; int len = 0, got = 0; byte[] pl = null;
+            try
+            {
+                foreach (var chunk in _rx.GetConsumingEnumerable())
+                    for (int i = 0; i < chunk.Length && _running; i++)
                     {
-                        int[] sync = new int[2];
-                        int[] id = new int[1];
-
-                        sync[0] = this.ReadByte(); // 0x03
-                        sync[1] = this.ReadByte(); // 0x15
-                        id[0] = this.ReadByte(); // 0x01, 0x02
-
-                        List<int> DataBuffer_Raw = new List<int>();
-                        List<int> DataBuffer_FFT = new List<int>();
-
-                        if (sync[0] == 0x03 && sync[1] == 0x15)
+                        byte b = chunk[i];
+                        switch (st)
                         {
-                            if(id[0] == 0x01)
-                            {
-                                int[] raw_size = new int[2];
-                                raw_size[0] = this.ReadByte();
-                                raw_size[1] = this.ReadByte();
-                                int tot_size = (raw_size[0] << 8) | raw_size[1];
-
-                                try
-                                {
-                                    while (tot_size > 0)
-                                    {
-                                        DataBuffer_Raw.Add(this.ReadByte());
-                                        tot_size--;
-                                    }
-                                }
-                                catch (Exception excep)
-                                {
-                                    // no data to read
-                                    MessageBox.Show(excep.ToString());
-                                }
-                                RawIntDataArray = DataBuffer_Raw.ToArray();
-                            }
-
-                            if(id[0] == 0x02)
-                            {
-                                int[] raw_size = new int[2];
-                                raw_size[0] = this.ReadByte();
-                                raw_size[1] = this.ReadByte();
-                                int tot_size = (raw_size[0] << 8) | raw_size[1];
-
-                                try
-                                {
-                                    while (tot_size > 0)
-                                    {
-                                        DataBuffer_FFT.Add(this.ReadByte());
-                                        tot_size--;
-                                    }
-                                }
-                                catch (Exception excep)
-                                {
-                                    // no data to read
-                                    MessageBox.Show(excep.ToString());
-                                }
-                                FFTIntDataArray = DataBuffer_FFT.ToArray();
-                            }
+                            case St.Sync0: st = b == SYNC0 ? St.Sync1 : St.Sync0; break;
+                            case St.Sync1: st = b == SYNC1 ? St.Id : b == SYNC0 ? St.Sync1 : St.Sync0; break;
+                            case St.Id: id = b; st = St.LenHi; break;
+                            case St.LenHi: len = b << 8; st = St.LenLo; break;
+                            case St.LenLo:
+                                len |= b;
+                                if (len <= 0 || len > 8192) { st = St.Sync0; break; }
+                                pl = new byte[len]; got = 0; st = St.Payload; break;
+                            case St.Payload:
+                                pl[got++] = b;
+                                if (got == len) { Dispatch(id, pl); st = St.Sync0; }
+                                break;
                         }
-                        else
-                        {
-                            // do something error
-                            //MessageBox.Show("Sync id not correct.");
-                        }
-                        //MessageBox.Show("End");
-                        //dataIN = RxDataFormat(RawDataArray);
-                        //this.BeginInvoke(new EventHandler(ShowData_TBoxDataIN));
                     }
-                }
+            }
+            catch { }
+        }
+
+        private void Dispatch(byte id, byte[] pl)
+        {
+            if (id == ID_RAW)
+            {
+                // Raw(Time Domain): 1바이트 = 1샘플 (256개, 0~255)
+                int c = pl.Length;
+                var r = new int[c];
+                for (int i = 0; i < c; i++) r[i] = pl[i];
+                lock (_lock) _rawSnap = r;
+            }
+            else if (id == ID_FFT)
+            {
+                // FFT(Freq Domain): float32 × N (1024바이트 = 256개)
+                if (pl.Length % 4 != 0) return; // 4의 배수가 아니면 정렬이 깨진 손상 패킷 → 버림
+                int c = pl.Length / 4;
+                var f = new float[c];
+                for (int i = 0; i < c; i++) f[i] = BitConverter.ToSingle(pl, i * 4);
+                lock (_lock) _fftSnap = f;
             }
         }
 
         /* =====================================*/
         /*                               Rx Control Setting                              */
         /* =====================================*/
-        private void ShowData_TBoxDataIN(object sneder, EventArgs e)
-        {
-            try
-            {
-                Lb_RxDataOutLength.Text = string.Format("{0:00}", dataINLength);
-
-                if (Chk_AlwaysUpdate.Checked)
-                {
-                    Chk_AddToOldData.Checked = false;
-                    TBoxDataIN.Text = dataIN;
-                }
-                else if (Chk_AddToOldData.Checked)
-                {
-                    Chk_AlwaysUpdate.Checked = false;
-                    TBoxDataIN.AppendText(System.Environment.NewLine);
-                    TBoxDataIN.AppendText(dataIN);
-                }
-            }
-            catch (Exception ex)
-            {
-                MessageBox.Show("Error : " + ex.Message, "An error occured", MessageBoxButtons.OK, MessageBoxIcon.Error);
-            }
-        }
-
-        private void Chk_AlwaysUpdate_CheckedChanged(object sender, EventArgs e)
-        {
-            if (Chk_AlwaysUpdate.Checked)
-            {
-                Chk_AlwaysUpdate.Checked = true;
-                Chk_AddToOldData.Checked = false;
-            }
-            else
-            {
-                Chk_AddToOldData.Checked = true;
-            }
-        }
-
-        private void Chk_AddToOldData_CheckedChanged(object sender, EventArgs e)
-        {
-            if (Chk_AddToOldData.Checked)
-            {
-                Chk_AlwaysUpdate.Checked = false;
-                Chk_AddToOldData.Checked = true;
-            }
-            else
-            {
-                Chk_AlwaysUpdate.Checked = true;
-            }
-        }
-
-        private void Chk_RxASC_CheckedChanged(object sender, EventArgs e)
-        {
-            if (Chk_RxASC.Checked)
-            {
-                Chk_RxASC.Checked = true;
-                Chk_RxHex.Checked = false;
-            }
-            else
-            {
-                Chk_RxHex.Checked = true;
-            }
-        }
-
-        private void Chk_RxHex_CheckedChanged(object sender, EventArgs e)
-        {
-            if (Chk_RxHex.Checked)
-            {
-                Chk_RxASC.Checked = false;
-                Chk_RxHex.Checked = true;
-            }
-            else
-            {
-                Chk_RxASC.Checked = true;
-            }
-        }
-
-        private void Btn_ClearDataIN_Click(object sender, EventArgs e)
-        {
-            if (TBoxDataIN.Text != "")
-            {
-                TBoxDataIN.Text = "";
-            }
-        }
-
-        private int ReadByte()
-        {
-            int trial = 50;
-            while (trial > 0) // 시도 회수가 아직 남아 잇는지
-            {
-                if (serialPort1.BytesToRead > 0) // 현재 버퍼에서 읽을 수 있는지
-                {
-                    return serialPort1.ReadByte(); // 버퍼에서 1바이트 리드
-                }
-                Thread.Sleep(1);
-                trial--; // 시도회수 감소
-            }
-            if (trial == 0)
-            {
-                MessageBox.Show("데이터가 없습니다.");
-                //throw new Exception("trial has been to zero"); // 시도회수를 모두 썼음에도 읽을 수 없었다면 에러
-            }
-            return 0;
-        }
 
         private void Form1_Resize(object sender, EventArgs e)
         {
@@ -466,36 +320,44 @@ namespace FFT_Monitor_STM32
 
         private void timer1_Tick(object sender, EventArgs e)
         {
-            chart1.Series["Series1"].Points.Clear();
-
-            for (int i = 0; i < Samples; i++)
-            {
-                RawIntArray[i] = RawIntDataArray[i];
-            }
-
-            for (int i = 0; i < Samples; i++)
-            {
-                chart1.Series["Series1"].Points.AddXY(i, RawIntArray[i]);
-            }
+            int[] r; lock (_lock) r = _rawSnap;
+            var s = chart1.Series["Series1"]; s.Points.Clear();
+            int n = Math.Min(Samples, r.Length);
+            for (int i = 0; i < n; i++) s.Points.AddXY(i, r[i]);
         }
 
         private void timer2_Tick(object sender, EventArgs e)
         {
-            chart2.Series["Series1"].Points.Clear();
+            float[] f; lock (_lock) f = _fftSnap;
+            var s = chart2.Series["Series1"]; s.Points.Clear();
+            int half = Math.Min(Samples / 2, f.Length);
+            // FastLine이 값→정수 픽셀로 변환할 때 오버플로(Overflow error.)가 나지 않도록,
+            // 축(0~3500) 대비 비현실적으로 큰 garbage 값은 제외한다. 정상 FFT 크기는 이보다 훨씬 작다.
+            const float PlotLimit = 1.0e7f;
 
-            for (int i = 0; i < Samples * 4; i++)
+            int peakIdx = -1;
+            float peakMag = 0f;
+            for (int i = 2; i < half; i++)
             {
-                FFTByteArray[i] = (byte)FFTIntDataArray[i];
+                float v = f[i];
+                // NaN / Infinity 또는 비현실적으로 큰 값(픽셀 변환 오버플로 유발)은 제외
+                if (float.IsNaN(v) || float.IsInfinity(v) || Math.Abs(v) > PlotLimit) continue;
+                s.Points.AddXY(i, v);
+
+                // 최대 크기 빈 = 기본 주파수
+                float mag = Math.Abs(v);
+                if (mag > peakMag) { peakMag = mag; peakIdx = i; }
             }
 
-            for (int i = 0; i < Samples; i++)
+            // Fundamental Freq 표시 (freq = peak × fs / N)
+            if (peakIdx > 0)
             {
-                FFTFloatArray[i] = BitConverter.ToSingle(FFTByteArray, i * 4);
+                double freq = peakIdx * Fs / Samples;
+                label2.Text = freq.ToString("0.0") + " Hz";
             }
-
-            for (int i = 2; i < Samples / 2; i++)
+            else
             {
-                chart2.Series["Series1"].Points.AddXY(i, FFTFloatArray[i]);
+                label2.Text = "-";
             }
         }
     }
