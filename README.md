@@ -1,8 +1,12 @@
 # FFT Monitor for STM32
 
-![STM32 FFT Monitor 실행 화면](docs/ProgramScreenshot02.png)
+![STM32 FFT Monitor 실행 화면](docs/ProgrmaScreenshot01.gif)
 
 > 상단: Raw ADC 파형 / 하단: FFT 스펙트럼 (Fundamental Freq 표시)
+
+![동작 화면](docs/RealTime%20View.gif)
+
+> 실시간 수신 동작 화면 (Raw / FFT 차트 동시 갱신)
 
 STM32 보드에서 시리얼(UART/COM) 포트로 전송하는 **Raw ADC 데이터**와 **FFT 연산 결과**를 PC에서 실시간으로 수신하여 그래프로 표시하는 Windows 모니터링 도구입니다.
 

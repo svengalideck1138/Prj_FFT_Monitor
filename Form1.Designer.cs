@@ -302,7 +302,7 @@
             this.chart1.Legends.Add(legend1);
             this.chart1.Location = new System.Drawing.Point(3, 3);
             this.chart1.Name = "chart1";
-            series1.BorderWidth = 3;
+            series1.BorderWidth = 5;
             series1.ChartArea = "ChartArea1";
             series1.ChartType = System.Windows.Forms.DataVisualization.Charting.SeriesChartType.FastLine;
             series1.Legend = "Legend1";
@@ -329,7 +329,7 @@
             this.chart2.Legends.Add(legend2);
             this.chart2.Location = new System.Drawing.Point(3, 203);
             this.chart2.Name = "chart2";
-            series2.BorderWidth = 3;
+            series2.BorderWidth = 5;
             series2.ChartArea = "ChartArea1";
             series2.ChartType = System.Windows.Forms.DataVisualization.Charting.SeriesChartType.FastLine;
             series2.Legend = "Legend1";
